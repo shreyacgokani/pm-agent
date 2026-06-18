@@ -1,0 +1,19 @@
+{
+  "name": "pm-agent-server",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.17",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "openai": "^4.77.0",
+    "pg": "^8.13.1",
+    "pg-mem": "^3.0.14",
+    "ws": "^8.21.0"
+  }
+}
