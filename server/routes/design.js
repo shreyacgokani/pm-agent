@@ -5,42 +5,55 @@ import {
   loadFullProject,
   getVersionCode,
   saveDesignVersion,
+  saveProjectFiles,
 } from '../services/designGithub.js';
 import { isGithubAuthenticated } from '../services/githubAuth.js';
 import { cleanGeneratedReact } from '../utils/designCode.js';
+import { SYSTEM_PROMPT } from '../utils/designSystemPrompt.js';
 
 const router = Router();
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const SYSTEM_PROMPT = `You are a frontend design AI. The user describes a UI and you return a complete React component that renders a beautiful, modern design.
-
-CRITICAL OUTPUT RULES:
-- Return ONLY raw React JSX code. No markdown, no code fences, no explanation, no preamble.
-- Export a single root component named App: use "function App() { ... }" or "const App = () => { ... }".
-- Use React 18 patterns. You may use useState, useEffect, useRef, useMemo, useCallback.
-- Include all CSS as a <style> tag INSIDE the App component's returned JSX (at the top of the fragment/div).
-- Do NOT use import, export, or require statements — React hooks are pre-declared globally.
-- NEVER write "import React" or "import { useState }" — use useState directly.
-- Do NOT use react-router, styled-components, or any npm packages — only React hooks and inline styles/CSS.
-- Use CSS custom properties for theming. Default to a clean, production-quality light theme unless asked otherwise.
-- Real placeholder content matching the prompt — never "Lorem ipsum".
-- Mobile responsive using CSS Grid and Flexbox with media queries in the embedded <style>.
-- Proper spacing (8px grid), typography scale, hover states, transitions (200ms ease).
-- If iterating on a previous design, you receive the previous React code — modify it directly, preserve what works.
-
-DESIGN QUALITY:
-- Pick one visual direction and commit fully (minimal, bold, editorial, soft, or dark).
-- One primary color, neutral palette, one accent — max 3 hues unless prompt demands more.
-- Real structure: nav, hero, cards, sections — not placeholder boxes.
-- When in doubt, make it look like a well-funded startup landing page or SaaS dashboard.`;
+async function planDesign(prompt) {
+  if (!prompt?.trim()) return null;
+  try {
+    const res = await openai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      max_tokens: 250,
+      temperature: 0.2,
+      response_format: { type: 'json_object' },
+      messages: [
+        {
+          role: 'system',
+          content: `Output JSON only with these exact fields:
+{
+  "appType": "dashboard-app|crm|healthcare|saas|landing|form|profile|card-collection",
+  "palette": "professional|dark|minimal|warm",
+  "pages": ["list of page names this app needs, max 8"],
+  "components": ["list of key components beyond pages, max 12"],
+  "complexity": "simple|medium|complex",
+  "brief": "one sentence describing the specific domain and content"
+}
+appType dashboard-app/crm/healthcare/saas = complex multi-page apps.
+landing/form/profile/card-collection = simpler single-view output.
+palette: professional=B2B/enterprise, dark=dev tools/premium, minimal=clean/forms, warm=healthcare/consumer.`,
+        },
+        { role: 'user', content: prompt },
+      ],
+    });
+    return JSON.parse(res.choices[0].message.content);
+  } catch {
+    return null;
+  }
+}
 
 const THINKING_PHASES = [
   { key: 'understand', text: 'Understanding your request…', minChars: 0 },
   { key: 'plan', text: 'Planning layout and component structure…', minChars: 80 },
   { key: 'components', text: 'Writing React components…', minChars: 250, pattern: /function\s+App|const\s+App\s*=/ },
   { key: 'styles', text: 'Applying styles and visual design…', minChars: 500, pattern: /className|<style/ },
-  { key: 'polish', text: 'Polishing interactions and responsive layout…', minChars: 1200 },
+  { key: 'polish', text: 'Polishing interactions and responsive layout…', minChars: 2500 },
 ];
 
 function stripCodeFences(source) {
@@ -123,6 +136,20 @@ router.get('/projects/:projectId/versions/:version', async (req, res) => {
   }
 });
 
+router.post('/projects/:projectId/files', async (req, res) => {
+  try {
+    if (!isGithubAuthenticated()) {
+      return res.json({ skipped: true });
+    }
+    const { files, version } = req.body;
+    const result = await saveProjectFiles(req.params.projectId, files, version);
+    res.json(result);
+  } catch (err) {
+    console.error('Save design files error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/generate', async (req, res) => {
   try {
     const { prompt, previousCode, projectId, projectName, isNew, createdAt } = req.body;
@@ -140,15 +167,37 @@ router.post('/generate', async (req, res) => {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
+    writeSse(res, { type: 'status', phase: 'understand', text: THINKING_PHASES[0].text });
+
+    const plan = previousCode?.trim() ? null : await planDesign(prompt);
+
+    const complexityNote = plan?.complexity === 'complex'
+      ? '\n\nThis is a COMPLEX application. Generate all pages and components. Target 900-1400 lines.'
+      : plan?.complexity === 'medium'
+        ? '\n\nThis is a MEDIUM complexity application. Generate multiple pages. Target 400-700 lines.'
+        : '';
+
     const userContent = previousCode?.trim()
       ? `Previous React code:\n${previousCode}\n\nRequested changes:\n${prompt}`
-      : prompt;
+      : plan
+        ? `Generate a ${plan.appType} using the ${plan.palette} palette.
 
-    writeSse(res, { type: 'status', phase: 'understand', text: THINKING_PHASES[0].text });
+USER REQUEST: "${prompt}"
+
+PLAN:
+- App type: ${plan.appType}
+- Palette: ${plan.palette}
+- Pages to include: ${plan.pages?.join(', ')}
+- Key components: ${plan.components?.join(', ')}
+- Domain brief: ${plan.brief}
+${complexityNote}
+
+Now generate the complete React application. Include ALL pages and components from the plan.`
+        : prompt;
 
     const stream = await openai.chat.completions.create({
       model: 'gpt-4o',
-      max_tokens: 8000,
+      max_tokens: 16000,
       temperature: 0.85,
       stream: true,
       messages: [

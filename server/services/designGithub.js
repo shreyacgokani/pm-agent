@@ -295,6 +295,7 @@ export async function saveDesignVersion({
   prompt,
   iterationPrompt,
   reactCode,
+  files = null,
   createdAt,
   isNew,
 }) {
@@ -337,6 +338,19 @@ export async function saveDesignVersion({
 
   await putFile(owner, repo, versionPath, reactCode, `Design v${versionNum}: ${name}`);
 
+  if (files && typeof files === 'object') {
+    const fileEntries = Object.entries(files);
+    for (let i = 0; i < fileEntries.length; i += 3) {
+      const batch = fileEntries.slice(i, i + 3);
+      await Promise.all(
+        batch.map(([filePath, fileContent]) => {
+          const githubPath = `${pathPrefix}v${versionNum}/${filePath}`;
+          return putFile(owner, repo, githubPath, fileContent, `v${versionNum}: ${filePath}`);
+        })
+      );
+    }
+  }
+
   const manifestSha = await getFileSha(owner, repo, manifestPath);
   await putFile(
     owner,
@@ -359,6 +373,30 @@ export async function saveDesignVersion({
     repoUrl,
     filePath: versionPath,
   };
+}
+
+export async function saveProjectFiles(projectId, files, version) {
+  if (!files || typeof files !== 'object') {
+    throw new Error('files required');
+  }
+
+  const manifest = await getProjectManifest(projectId);
+  const storage = await resolveProjectStorage(projectId, manifest.name, false, manifest);
+  const { owner, repo } = storage;
+  const versionNum = version || manifest.versions?.length || 1;
+  const entries = Object.entries(files);
+
+  for (let i = 0; i < entries.length; i += 3) {
+    const batch = entries.slice(i, i + 3);
+    await Promise.all(
+      batch.map(([filePath, content]) =>
+        putFile(owner, repo, `v${versionNum}/${filePath}`, content, `v${versionNum}: ${filePath}`)
+          .catch(() => {})
+      )
+    );
+  }
+
+  return { saved: entries.length, version: versionNum };
 }
 
 export async function loadFullProject(projectId) {
