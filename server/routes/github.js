@@ -12,10 +12,19 @@ import {
   connectWithPat,
   clearAuth,
   getGithubAuthStatus,
+  getGithubAccessToken,
   setSelectedRepo,
   clearSelectedRepo,
   getFrontendRedirect,
+  evaluateGithubPermissions,
+  GITHUB_OAUTH_SCOPES,
+  isOAuthConfigured,
+  renderManifestBootstrapPage,
+  saveOAuthConfig,
+  isLocalDev,
+  canUseManifestBootstrap,
 } from '../services/githubAuth.js';
+import { inspectGithubToken } from '../services/designGithub.js';
 
 const router = Router();
 
@@ -23,11 +32,67 @@ router.get('/auth/status', (_req, res) => {
   res.json(getGithubAuthStatus());
 });
 
+router.get('/auth/capabilities', async (_req, res) => {
+  try {
+    const token = getGithubAccessToken();
+    if (!token) {
+      return res.json({ connected: false, design: null, permissions: evaluateGithubPermissions() });
+    }
+    const design = await inspectGithubToken(token);
+    res.json({
+      connected: true,
+      design,
+      permissions: evaluateGithubPermissions(),
+      oauthScopes: GITHUB_OAUTH_SCOPES,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.get('/auth/login', (req, res) => {
   try {
+    if (isOAuthConfigured()) {
+      const state = createOAuthState();
+      return res.redirect(getOAuthAuthorizeUrl(state));
+    }
+    if (canUseManifestBootstrap()) {
+      return res.type('html').send(renderManifestBootstrapPage());
+    }
+    res.redirect(`${getFrontendRedirect('/integrations')}?oauth_hint=local`);
+  } catch (err) {
+    res.redirect(`${getFrontendRedirect('/integrations')}?error=${encodeURIComponent(err.message)}`);
+  }
+});
+
+router.post('/webhook', (_req, res) => {
+  res.sendStatus(204);
+});
+
+router.get('/manifest/callback', async (req, res) => {
+  try {
+    const { code, error, error_description } = req.query;
+    if (error) throw new Error(error_description || error);
+    if (!code) throw new Error('Missing manifest code from GitHub.');
+
+    const conversion = await fetch(`https://api.github.com/app-manifests/${code}/conversions`, {
+      method: 'POST',
+      headers: { Accept: 'application/vnd.github+json' },
+    });
+    const data = await conversion.json();
+    if (!conversion.ok) {
+      throw new Error(data.message || 'Failed to register GitHub app.');
+    }
+
+    saveOAuthConfig({
+      clientId: data.client_id,
+      clientSecret: data.client_secret,
+      appSlug: data.slug,
+      appId: data.id,
+    });
+
     const state = createOAuthState();
-    const url = getOAuthAuthorizeUrl(state);
-    res.redirect(url);
+    res.redirect(getOAuthAuthorizeUrl(state));
   } catch (err) {
     res.redirect(`${getFrontendRedirect('/integrations')}?error=${encodeURIComponent(err.message)}`);
   }
@@ -54,12 +119,14 @@ router.get('/callback', async (req, res) => {
 router.post('/auth/pat', async (req, res) => {
   try {
     const { token } = req.body;
-    const user = await connectWithPat(token);
+    const { user, isFineGrained } = await connectWithPat(token);
     res.json({
       connected: true,
       username: user.login,
       avatarUrl: user.avatar_url,
       method: 'pat',
+      isFineGrained,
+      designAgentLimited: isFineGrained,
     });
   } catch (err) {
     res.status(400).json({ error: err.message });

@@ -1,7 +1,7 @@
 import { extractVoicePrompt } from './jiraGeneration.js';
 import { formatRepoSummaryForVoice } from './github.js';
 
-const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview-2024-12-17';
+const REALTIME_MODEL = process.env.OPENAI_REALTIME_MODEL || 'gpt-realtime';
 const REALTIME_VOICE = 'shimmer';
 
 const VOICE_RULES = `You are Sarah, a friendly PM on a live voice call. American English. Warm, human, encouraging — like a real colleague.
@@ -42,18 +42,26 @@ export function buildSessionUpdate(instructions) {
   return {
     type: 'session.update',
     session: {
-      modalities: ['audio', 'text'],
+      type: 'realtime',
+      model: REALTIME_MODEL,
       instructions,
-      voice: REALTIME_VOICE,
-      input_audio_format: 'pcm16',
-      output_audio_format: 'pcm16',
-      input_audio_transcription: { model: 'whisper-1' },
-      turn_detection: {
-        type: 'server_vad',
-        threshold: 0.65,
-        prefix_padding_ms: 300,
-        silence_duration_ms: 1200,
-        create_response: true,
+      output_modalities: ['audio'],
+      audio: {
+        input: {
+          format: { type: 'audio/pcm', rate: 24000 },
+          transcription: { model: 'whisper-1' },
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.65,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 1200,
+            create_response: true,
+          },
+        },
+        output: {
+          format: { type: 'audio/pcm', rate: 24000 },
+          voice: REALTIME_VOICE,
+        },
       },
     },
   };
@@ -63,7 +71,6 @@ export function buildOpeningResponse() {
   return {
     type: 'response.create',
     response: {
-      modalities: ['audio', 'text'],
       instructions:
         "Give a brief warm hello. You're Sarah their PM. You've looked over the project. Ask what area or flow they want Jira tickets for. Max 2 sentences.",
     },

@@ -13,6 +13,7 @@ import generateRoutes from './routes/generate.js';
 import githubRoutes from './routes/github.js';
 import chatRoutes from './routes/chat.js';
 import ttsRoutes from './routes/tts.js';
+import designRoutes from './routes/design.js';
 
 dotenv.config();
 
@@ -42,6 +43,7 @@ app.use('/api/generate', generateRoutes);
 app.use('/api/github', githubRoutes);
 app.use('/api/chat', chatRoutes);
 app.use('/api/tts', ttsRoutes);
+app.use('/api/design', designRoutes);
 
 await initDb();
 

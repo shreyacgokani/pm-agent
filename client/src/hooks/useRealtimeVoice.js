@@ -270,6 +270,7 @@ export function useRealtimeVoice(sessionId) {
         if (!isSarahSpeakingRef.current) setIsThinking(false);
         break;
       case 'response.audio.delta':
+      case 'response.output_audio.delta':
         enterSpeakingMode();
         if (DEBUG_AUDIO && audioChunkCountRef.current === 0) {
           console.log('[Sarah audio] first delta prefix:', (message.delta || '').slice(0, 20));
@@ -277,9 +278,11 @@ export function useRealtimeVoice(sessionId) {
         queueAudioChunk(message.delta);
         break;
       case 'response.audio_transcript.delta':
+      case 'response.output_audio_transcript.delta':
         setStreamingText((prev) => prev + (message.delta || ''));
         break;
       case 'response.audio_transcript.done':
+      case 'response.output_audio_transcript.done':
         if (message.transcript) {
           setStreamingText(message.transcript);
           setTranscript((prev) => [...prev, { role: 'agent', text: message.transcript, at: Date.now() }]);
@@ -289,11 +292,15 @@ export function useRealtimeVoice(sessionId) {
         setIsThinking(true);
         setStreamingText('');
         audioChunkCountRef.current = 0;
+        nextPlayTimeRef.current = audioCtxRef.current?.currentTime ?? 0;
         setCallState('processing');
         break;
-      case 'error':
-        console.error('[Sarah realtime] error:', message.error);
+      case 'error': {
+        const err = message.error;
+        const errMsg = typeof err === 'string' ? err : err?.message || JSON.stringify(err);
+        console.error('[Sarah realtime] error:', errMsg);
         break;
+      }
       default:
         break;
     }
@@ -332,11 +339,14 @@ export function useRealtimeVoice(sessionId) {
     const ws = new WebSocket(getWsUrl(sid));
     wsRef.current = ws;
 
-    ws.onmessage = (event) => {
+    ws.onmessage = async (event) => {
       try {
-        handleServerEventRef.current(JSON.parse(event.data));
-      } catch {
-        // ignore
+        let raw = event.data;
+        if (raw instanceof Blob) raw = await raw.text();
+        else if (raw instanceof ArrayBuffer) raw = new TextDecoder().decode(raw);
+        handleServerEventRef.current(JSON.parse(raw));
+      } catch (err) {
+        if (DEBUG_AUDIO) console.warn('[Sarah audio] ws message parse failed:', err);
       }
     };
 

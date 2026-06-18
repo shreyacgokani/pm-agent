@@ -51,6 +51,7 @@ export const api = {
   },
   github: {
     status: () => request('/github/auth/status'),
+    capabilities: () => request('/github/auth/capabilities'),
     connectPat: (token) =>
       request('/github/auth/pat', { method: 'POST', body: JSON.stringify({ token }) }),
     disconnect: () => request('/github/auth/disconnect', { method: 'DELETE' }),

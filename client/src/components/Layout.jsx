@@ -11,6 +11,12 @@ const NAV = [
     ],
   },
   {
+    section: 'Design',
+    items: [
+      { to: '/design-agent', label: 'Design Agent', icon: '◈' },
+    ],
+  },
+  {
     section: 'Tickets',
     items: [
       { to: '/pm-agent', label: 'Generated Tickets', icon: '☰' },
