@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { applyPreviewToIframe, buildPreviewDocument, prepareReactCode, stripCodeFences } from '../utils/designPreview.js';
-import { parseIntoFileTree, fileLabel, sortFilePaths } from '../utils/designParser.js';
+import DesignFileTree from '../components/DesignFileTree.jsx';
+import DesignSandpackPreview from '../components/DesignSandpackPreview.jsx';
+import { buildPreviewDocument } from '../utils/designPreview.js';
+import { sortFilePaths } from '../utils/designFileTree.js';
 
 const STORAGE_KEY = 'design-agent-projects';
 const SIDEBAR_WIDTH_KEY = 'design-chat-sidebar-width';
@@ -11,11 +13,23 @@ const SIDEBAR_DEFAULT = 360;
 const THINKING_STEPS = [
   { key: 'understand', text: 'Understanding your request…' },
   { key: 'plan', text: 'Planning layout and component structure…' },
-  { key: 'components', text: 'Writing React components…' },
-  { key: 'styles', text: 'Applying styles and visual design…' },
-  { key: 'polish', text: 'Polishing interactions and responsive layout…' },
-  { key: 'save', text: 'Saving to your project repo on GitHub…' },
+  { key: 'scaffold', text: 'Setting up Vite + React project scaffold…' },
+  { key: 'components', text: 'Writing React components across multiple files…' },
+  { key: 'styles', text: 'Applying design tokens and global styles…' },
+  { key: 'bundle', text: 'Bundling project for preview…' },
+  { key: 'save', text: 'Saving full project to GitHub…' },
 ];
+
+function normalizeProjectFiles(project) {
+  if (project?.files && Object.keys(project.files).length) return project.files;
+  if (project?.code?.trim()) return { 'src/app/App.jsx': project.code };
+  return null;
+}
+
+function pickDefaultFile(files) {
+  const paths = sortFilePaths(Object.keys(files || {}));
+  return paths.find((p) => p.endsWith('App.jsx')) || paths[0] || 'src/app/App.jsx';
+}
 
 function relativeTime(ts) {
   const sec = Math.floor((Date.now() - ts) / 1000);
@@ -36,7 +50,8 @@ function loadLocalProjects() {
       messages: p.messages || [],
       versions: p.versions || [],
       activeVersion: p.activeVersion || p.iterations || 1,
-      fileTree: p.fileTree || null,
+      files: p.files || p.fileTree || null,
+      fileTree: p.files || p.fileTree || null,
     }));
   } catch {
     return [];
@@ -58,7 +73,7 @@ function buildThinkingSteps(activePhase) {
 }
 
 async function streamDesign(params, handlers) {
-  const { prompt, previousCode, projectId, projectName, isNew, createdAt, signal } = params;
+  const { prompt, previousCode, previousFiles, projectId, projectName, isNew, createdAt, signal } = params;
   const { onDelta, onStatus, onComplete, onSaved, onVersionInfo, onGithubError, onDone, onError } = handlers;
 
   try {
@@ -68,6 +83,7 @@ async function streamDesign(params, handlers) {
       body: JSON.stringify({
         prompt,
         previousCode: previousCode || '',
+        previousFiles: previousFiles || null,
         projectId,
         projectName,
         isNew,
@@ -146,18 +162,27 @@ function ThinkingBubble({ steps }) {
 }
 
 function ProjectTile({ project, onClick }) {
-  const previewHtml = project.previewHtml || (project.code ? buildPreviewDocument(project.code) : '');
+  const files = normalizeProjectFiles(project);
+  const hasFiles = Boolean(files);
+  const legacyHtml = !hasFiles && project.code?.trim()
+    ? buildPreviewDocument(project.code)
+    : '';
 
   return (
     <button type="button" className="design-tile" onClick={() => onClick(project)}>
       <div className="design-tile-preview">
-        {previewHtml ? (
+        {legacyHtml ? (
           <iframe
             title={`Preview ${project.name}`}
             sandbox="allow-scripts"
-            srcDoc={previewHtml}
+            srcDoc={legacyHtml}
             tabIndex={-1}
           />
+        ) : hasFiles ? (
+          <div className="design-tile-placeholder design-tile-has-project">
+            <span>◈</span>
+            <small>{Object.keys(files).length} files</small>
+          </div>
         ) : (
           <div className="design-tile-placeholder">
             <span>◈</span>
@@ -191,9 +216,10 @@ export default function DesignAgent() {
   const [errorMessage, setErrorMessage] = useState('');
   const [githubConnected, setGithubConnected] = useState(false);
   const [thinkingSteps, setThinkingSteps] = useState(null);
-  const [previewHtml, setPreviewHtml] = useState('');
+  const [previewFiles, setPreviewFiles] = useState(null);
   const [fileTree, setFileTree] = useState(null);
-  const [activeFile, setActiveFile] = useState('src/App.jsx');
+  const [activeFile, setActiveFile] = useState('src/app/App.jsx');
+  const [previewStatus, setPreviewStatus] = useState('');
   const [showVersionMenu, setShowVersionMenu] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(() => {
     try {
@@ -206,8 +232,6 @@ export default function DesignAgent() {
   const [, setTick] = useState(0);
 
   const streamBufferRef = useRef('');
-  const rafRef = useRef(null);
-  const iframeRef = useRef(null);
   const chatEndRef = useRef(null);
   const abortRef = useRef(null);
   const versionMenuRef = useRef(null);
@@ -275,7 +299,8 @@ export default function DesignAgent() {
                 merged.set(gp.id, {
                   ...gp,
                   code: '',
-                  previewHtml: '',
+                  files: null,
+                  fileTree: null,
                   messages: [],
                   versions: [],
                   activeVersion: gp.latestVersion || 1,
@@ -292,7 +317,6 @@ export default function DesignAgent() {
 
   useEffect(() => () => {
     if (abortRef.current) abortRef.current.abort();
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }, []);
 
   useEffect(() => {
@@ -311,23 +335,17 @@ export default function DesignAgent() {
     return () => document.removeEventListener('mousedown', handler);
   }, []);
 
-  const applyPreview = useCallback((reactCode) => {
-    const html = buildPreviewDocument(reactCode);
-    setPreviewHtml(html || '');
+  const applyFiles = useCallback((files) => {
+    if (!files || !Object.keys(files).length) {
+      setPreviewFiles(null);
+      setFileTree(null);
+      return null;
+    }
+    setPreviewFiles(files);
+    setFileTree(files);
+    setActiveFile(pickDefaultFile(files));
+    return files;
   }, []);
-
-  const syncFileTreeFromCode = useCallback((reactCode) => {
-    const tree = parseIntoFileTree(reactCode);
-    const paths = sortFilePaths(Object.keys(tree));
-    setFileTree(tree);
-    setActiveFile(paths[0] || 'src/App.jsx');
-    return tree;
-  }, []);
-
-  useEffect(() => {
-    if (!previewHtml || !iframeRef.current) return;
-    applyPreviewToIframe(iframeRef.current, previewHtml);
-  }, [previewHtml, view]);
 
   const updateProject = useCallback((projectId, updater) => {
     setProjects((prev) => prev.map((p) => (p.id === projectId ? updater(p) : p)));
@@ -340,24 +358,25 @@ export default function DesignAgent() {
     setView('workspace');
     setThinkingSteps(null);
 
-    if (githubConnected && project.id && !project.code) {
+    if (githubConnected && project.id) {
       try {
         const res = await fetch(`/api/design/projects/${project.id}`);
         if (res.ok) {
           const full = await res.json();
-          const code = full.code || '';
-          const html = buildPreviewDocument(code);
+          const files = full.files && Object.keys(full.files).length
+            ? full.files
+            : normalizeProjectFiles(full);
           const loaded = {
             ...project,
             ...full,
-            code,
-            previewHtml: html,
+            files,
+            fileTree: files,
+            code: full.code || files?.['src/app/App.jsx'] || '',
             activeVersion: full.activeVersion || full.iterations,
           };
           setActiveProject(loaded);
           setProjects((prev) => prev.map((p) => (p.id === loaded.id ? loaded : p)));
-          applyPreview(code);
-          syncFileTreeFromCode(code);
+          applyFiles(files);
           return;
         }
       } catch {
@@ -366,18 +385,14 @@ export default function DesignAgent() {
     }
 
     setActiveProject(project);
-    if (project.code) {
-      applyPreview(project.code);
-      syncFileTreeFromCode(project.code);
-      if (project.fileTree) {
-        setFileTree(project.fileTree);
-        setActiveFile(sortFilePaths(Object.keys(project.fileTree))[0] || 'src/App.jsx');
-      }
+    const files = normalizeProjectFiles(project);
+    if (files) {
+      applyFiles(files);
     } else {
-      setPreviewHtml('');
+      setPreviewFiles(null);
       setFileTree(null);
     }
-  }, [githubConnected, applyPreview, syncFileTreeFromCode]);
+  }, [githubConnected, applyFiles]);
 
   const goHome = useCallback(() => {
     setView('landing');
@@ -386,9 +401,10 @@ export default function DesignAgent() {
     setErrorMessage('');
     setShowCode(false);
     setThinkingSteps(null);
-    setPreviewHtml('');
+    setPreviewFiles(null);
     setFileTree(null);
-    setActiveFile('src/App.jsx');
+    setActiveFile('src/app/App.jsx');
+    setPreviewStatus('');
   }, []);
 
   const restoreVersion = useCallback(async (version) => {
@@ -396,16 +412,25 @@ export default function DesignAgent() {
     setShowVersionMenu(false);
 
     const localVersion = activeProject.versions?.find((v) => v.v === version);
-    if (localVersion?.code) {
+    if (localVersion?.files) {
       const updated = {
         ...activeProject,
-        code: localVersion.code,
+        files: localVersion.files,
+        fileTree: localVersion.files,
+        code: localVersion.files['src/app/App.jsx'] || localVersion.code || '',
         activeVersion: version,
       };
       setActiveProject(updated);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-      applyPreview(localVersion.code);
-      syncFileTreeFromCode(localVersion.code);
+      applyFiles(localVersion.files);
+      return;
+    }
+    if (localVersion?.code) {
+      const files = { 'src/app/App.jsx': localVersion.code };
+      const updated = { ...activeProject, code: localVersion.code, files, fileTree: files, activeVersion: version };
+      setActiveProject(updated);
+      setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      applyFiles(files);
       return;
     }
 
@@ -415,22 +440,28 @@ export default function DesignAgent() {
     }
 
     try {
-      const res = await fetch(`/api/design/projects/${activeProject.id}/versions/${version}`);
+      const res = await fetch(`/api/design/projects/${activeProject.id}/tree?version=${version}`);
       if (!res.ok) throw new Error('Failed to load version');
-      const { code } = await res.json();
+      const { files, code: apiCode } = await res.json();
+      const resolvedFiles = files && Object.keys(files).length
+        ? files
+        : apiCode
+          ? { 'src/app/App.jsx': apiCode }
+          : null;
       const updated = {
         ...activeProject,
-        code,
+        files: resolvedFiles,
+        fileTree: resolvedFiles,
+        code: resolvedFiles?.['src/app/App.jsx'] || apiCode || '',
         activeVersion: version,
       };
       setActiveProject(updated);
       setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
-      applyPreview(code);
-      syncFileTreeFromCode(code);
+      applyFiles(resolvedFiles);
     } catch (err) {
       setErrorMessage(err.message);
     }
-  }, [activeProject, isGenerating, applyPreview, githubConnected, syncFileTreeFromCode]);
+  }, [activeProject, isGenerating, applyFiles, githubConnected]);
 
   const resizeTextarea = useCallback((el) => {
     if (!el) return;
@@ -461,7 +492,8 @@ export default function DesignAgent() {
       name: isNew ? trimmed.slice(0, 60) : source.name,
       prompt: isNew ? trimmed : source.prompt,
       code: isNew ? '' : source.code,
-      previewHtml: isNew ? '' : source.previewHtml,
+      files: isNew ? null : (source.files || source.fileTree || null),
+      fileTree: isNew ? null : (source.fileTree || source.files || null),
       status: 'generating',
       createdAt: isNew ? Date.now() : source.createdAt,
       iterations: isNew ? 0 : source.iterations,
@@ -481,13 +513,17 @@ export default function DesignAgent() {
     setErrorMessage('');
     setView('workspace');
     setThinkingSteps(buildThinkingSteps('understand'));
-    streamBufferRef.current = isNew ? '' : (source.code || '');
+    setPreviewStatus('');
+    streamBufferRef.current = '';
+
+    const previousFiles = isNew ? null : normalizeProjectFiles(source);
 
     try {
       await streamDesign(
         {
           prompt: trimmed,
-          previousCode: isNew ? '' : source.code,
+          previousCode: isNew ? '' : (source.code || ''),
+          previousFiles,
           projectId,
           projectName: newProject.name,
           isNew,
@@ -495,42 +531,36 @@ export default function DesignAgent() {
           signal: abortRef.current.signal,
         },
         {
-          onStatus: (phase) => {
+          onStatus: (phase, text) => {
             setThinkingSteps(buildThinkingSteps(phase));
+            if (text) setPreviewStatus(text);
           },
-          onDelta: (delta) => {
-            streamBufferRef.current += delta;
-            const buf = streamBufferRef.current;
-            if (buf.length > 300 && buf.length % 600 < delta.length) {
-              if (rafRef.current) cancelAnimationFrame(rafRef.current);
-              rafRef.current = requestAnimationFrame(() => {
-                const partial = buildPreviewDocument(buf);
-                if (partial && iframeRef.current) {
-                  applyPreviewToIframe(iframeRef.current, partial);
-                }
-              });
-            }
-          },
+          onDelta: () => {},
           onComplete: (data) => {
-            const reactCode = prepareReactCode(stripCodeFences(data.code || streamBufferRef.current));
-            streamBufferRef.current = reactCode;
+            const files = data.files && Object.keys(data.files).length
+              ? data.files
+              : data.code
+                ? { 'src/app/App.jsx': data.code }
+                : null;
 
-            if (!reactCode) {
-              setErrorMessage('No code was generated. Try again.');
+            if (!files) {
+              setErrorMessage('No project files were generated. Try again.');
               setThinkingSteps(null);
               setIsGenerating(false);
               return;
             }
 
+            const reactCode = files['src/app/App.jsx'] || data.code || '';
             const version = newProject.iterations + 1;
-            applyPreview(reactCode);
-            const tree = syncFileTreeFromCode(reactCode);
+            applyFiles(files);
             setThinkingSteps(null);
+            setPreviewStatus('');
 
+            const fileCount = data.fileCount || Object.keys(files).length;
             const doneMsg = {
               id: crypto.randomUUID(),
               role: 'assistant',
-              text: 'Design ready — preview loaded.',
+              text: `Design ready — ${fileCount} files. Clone the GitHub repo and run npm install && npm run dev.`,
               at: Date.now(),
               status: 'done',
             };
@@ -538,8 +568,8 @@ export default function DesignAgent() {
             updateProject(projectId, (p) => ({
               ...p,
               code: reactCode,
-              fileTree: tree,
-              previewHtml: buildPreviewDocument(reactCode),
+              files,
+              fileTree: files,
               status: 'done',
               iterations: version,
               activeVersion: version,
@@ -550,18 +580,11 @@ export default function DesignAgent() {
                   label: version === 1 ? 'Initial' : `Version ${version}`,
                   createdAt: Date.now(),
                   code: reactCode,
+                  files,
                 },
               ],
               messages: [...p.messages, doneMsg],
             }));
-
-            if (githubConnected && projectId) {
-              fetch(`/api/design/projects/${projectId}/files`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ files: tree, version }),
-              }).catch(() => {});
-            }
           },
           onSaved: (data) => {
             updateProject(projectId, (p) => ({
@@ -576,7 +599,7 @@ export default function DesignAgent() {
                 {
                   id: crypto.randomUUID(),
                   role: 'assistant',
-                  text: `Saved to GitHub as v${data.version} → ${data.githubRepo}`,
+                  text: `Saved to GitHub — full React app at repo root (${data.fileCount || '?'} files). Share ${data.githubRepo} with your backend dev.`,
                   at: Date.now(),
                   status: 'done',
                 },
@@ -588,6 +611,7 @@ export default function DesignAgent() {
                   label: data.version === 1 ? 'Initial' : `Version ${data.version}`,
                   createdAt: Date.now(),
                   code: p.code,
+                  files: p.files || p.fileTree,
                 },
               ],
             }));
@@ -647,7 +671,7 @@ export default function DesignAgent() {
         setThinkingSteps(null);
       }
     }
-  }, [activeProject, isGenerating, updateProject, applyPreview, syncFileTreeFromCode, githubConnected]);
+  }, [activeProject, isGenerating, updateProject, applyFiles, githubConnected]);
 
   const handleLandingSubmit = useCallback(() => {
     runGenerate(promptValue);
@@ -666,7 +690,7 @@ export default function DesignAgent() {
 
   const handleCopy = useCallback(async () => {
     const content = fileTree
-      ? (fileTree[activeFile] || fileTree['src/App.jsx'] || '')
+      ? (fileTree[activeFile] || fileTree['src/app/App.jsx'] || '')
       : activeProject?.code;
     if (!content) return;
     try {
@@ -678,14 +702,25 @@ export default function DesignAgent() {
     }
   }, [fileTree, activeFile, activeProject?.code]);
 
-  const handleFullscreen = useCallback(() => {
-    if (!previewHtml) return;
-    const win = window.open('', '_blank', 'width=1400,height=900');
-    if (!win) return;
-    win.document.open();
-    win.document.write(previewHtml);
-    win.document.close();
-  }, [previewHtml]);
+  const handleDownload = useCallback(() => {
+    if (!activeProject?.id) return;
+    const version = activeProject.activeVersion || activeProject.iterations || 1;
+    if (githubConnected) {
+      window.open(`/api/design/projects/${activeProject.id}/download?version=${version}`, '_blank');
+      return;
+    }
+    if (!fileTree) return;
+    const lines = Object.entries(fileTree)
+      .map(([path, content]) => `--- ${path} ---\n${content}`)
+      .join('\n\n');
+    const blob = new Blob([lines], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `design-${activeProject.id}-v${version}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }, [activeProject, fileTree, githubConnected]);
 
   const handleKeyDown = (e, onSubmit) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -711,12 +746,12 @@ export default function DesignAgent() {
             <div className="design-landing-icon">◈</div>
             <h1 className="design-landing-title">Design Agent</h1>
             <p className="design-landing-subtitle">
-              Describe any screen, component, or page — AI builds it in React.
+              Describe any app — AI builds a full Vite + React project you can download and run with npm run dev.
             </p>
 
             {!githubConnected && (
               <p className="design-landing-github-hint">
-                Connect GitHub in Integrations — each project gets its own private repo with version history.
+                Connect GitHub in Integrations — each project gets its own clone-ready Vite + React repo (npm install && npm run dev).
               </p>
             )}
 
@@ -829,7 +864,7 @@ export default function DesignAgent() {
               className="design-btn-remix design-chat-remix"
               title="Remix"
               onClick={handleRemix}
-              disabled={!activeProject?.code || isGenerating}
+              disabled={!activeProject?.files && !activeProject?.code && !activeProject?.fileTree || isGenerating}
             >
               ⇄
             </button>
@@ -888,12 +923,12 @@ export default function DesignAgent() {
           <div className="design-topbar-actions">
             <button
               type="button"
-              className="design-fullscreen-btn"
-              onClick={handleFullscreen}
-              title="Open fullscreen preview"
-              disabled={!previewHtml}
+              className="design-download-btn"
+              onClick={handleDownload}
+              title="Download project (ZIP from GitHub, or text bundle locally)"
+              disabled={!previewFiles && !fileTree}
             >
-              ⤢
+              ↓ ZIP
             </button>
             <button
               type="button"
@@ -906,25 +941,24 @@ export default function DesignAgent() {
         </div>
 
         <div className="design-preview-wrap">
-          {!previewHtml && !isGenerating && (
+          {!previewFiles && !isGenerating && (
             <div className="design-empty-state">
               <span className="design-empty-icon">◈</span>
               <div className="design-empty-heading">Waiting for design</div>
-              <div className="design-empty-sub">Preview appears when coding finishes</div>
+              <div className="design-empty-sub">Sandpack preview loads when generation finishes</div>
             </div>
           )}
 
-          <iframe
-            ref={iframeRef}
-            className={`design-preview-iframe ${previewHtml ? 'visible' : ''}`}
-            title="Design preview"
-            sandbox="allow-scripts allow-forms"
-          />
+          {previewFiles && (
+            <DesignSandpackPreview files={previewFiles} className="visible" />
+          )}
 
-          {isGenerating && !previewHtml && (
+          {isGenerating && (
             <div className="design-generating-overlay">
               <div className="design-generating-spinner" />
-              <div className="design-generating-label">Building your React design…</div>
+              <div className="design-generating-label">
+                {previewStatus || 'Building your React project…'}
+              </div>
             </div>
           )}
 
@@ -938,7 +972,7 @@ export default function DesignAgent() {
 
       <aside className={`design-code-panel ${showCode ? 'open' : ''}`}>
         <div className="design-code-header">
-          <span className="design-code-title">Code</span>
+          <span className="design-code-title">Explorer</span>
           <button
             type="button"
             className="design-code-copy"
@@ -949,28 +983,23 @@ export default function DesignAgent() {
           </button>
         </div>
 
-        {fileTree && Object.keys(fileTree).length > 1 && (
-          <div className="design-file-tabs">
-            {sortFilePaths(Object.keys(fileTree)).map((path) => (
-              <button
-                key={path}
-                type="button"
-                className={`design-file-tab ${activeFile === path ? 'active' : ''}`}
-                onClick={() => setActiveFile(path)}
-                title={path}
-              >
-                {fileLabel(path)}
-              </button>
-            ))}
-          </div>
-        )}
+        <div className="design-code-split">
+          {fileTree && Object.keys(fileTree).length > 0 && (
+            <DesignFileTree
+              files={fileTree}
+              activeFile={activeFile}
+              onSelectFile={setActiveFile}
+            />
+          )}
 
-        <div className="design-code-body">
-          <pre><code>
-            {fileTree
-              ? (fileTree[activeFile] || fileTree['src/App.jsx'] || '')
-              : (activeProject?.code || '')}
-          </code></pre>
+          <div className="design-code-body">
+            <div className="design-code-filepath">{activeFile}</div>
+            <pre><code>
+              {fileTree
+                ? (fileTree[activeFile] || fileTree['src/app/App.jsx'] || '')
+                : (activeProject?.code || '')}
+            </code></pre>
+          </div>
         </div>
       </aside>
     </div>

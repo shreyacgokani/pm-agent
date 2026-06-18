@@ -27,6 +27,45 @@ export function prepareReactCode(raw) {
   return code.replace(/\n{3,}/g, '\n\n').trim();
 }
 
+import { prepareFilesForPreview, previewSourceFiles, isPreviewableFile } from './designPreviewFiles.js';
+
+function stripImportsExports(code) {
+  let out = code || '';
+  out = out.replace(/import\s+(?:type\s+)?[\s\S]*?from\s*['"][^'"]+['"]\s*;?/g, '');
+  out = out.replace(/import\s*['"][^'"]+['"]\s*;?/g, '');
+  out = out.replace(/^\s*import\s+.+$/gm, '');
+  out = out.replace(/export\s+default\s+/g, '');
+  out = out.replace(/^export\s+(function|const|class)\s+/gm, '$1 ');
+  out = out.replace(/^export\s+\{[\s\S]*?\}\s*;?$/gm, '');
+  return out.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/** Bundle multi-file project into a single Babel iframe preview (fallback when Sandpack fails). */
+export function buildMultiFilePreviewDocument(files) {
+  if (!files || typeof files !== 'object') return '';
+
+  const prepared = prepareFilesForPreview(files);
+  const paths = Object.keys(prepared).filter(isPreviewableFile);
+  const jsxPaths = paths.filter((p) => /\.(jsx|js)$/.test(p));
+  if (!jsxPaths.length) return '';
+
+  const appPath = jsxPaths.find((p) => p.endsWith('App.jsx')) || jsxPaths[0];
+  const css = paths
+    .filter((p) => p.endsWith('.css'))
+    .map((p) => prepared[p])
+    .join('\n');
+
+  const ordered = [
+    ...jsxPaths.filter((p) => p !== appPath),
+    appPath,
+  ];
+
+  const bundled = ordered.map((p) => stripImportsExports(prepared[p])).join('\n\n');
+  const html = buildPreviewDocument(bundled);
+  if (!css || !html) return html;
+  return html.replace('</style>', `${css}\n  </style>`);
+}
+
 function scriptSrc(file) {
   if (typeof window !== 'undefined' && window.location?.origin) {
     return `${window.location.origin}/api/design/runtime/${file}`;

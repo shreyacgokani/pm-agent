@@ -1,3 +1,4 @@
+import AdmZip from 'adm-zip';
 import {
   getGithubAccessToken,
   getSelectedRepo,
@@ -281,12 +282,166 @@ export async function getProjectManifest(projectId) {
   return JSON.parse(raw);
 }
 
-export async function getVersionCode(projectId, version) {
+const ARCHIVE_PREFIX = '.design-versions';
+const LEGACY_VERSION_PREFIX = /^v\d+\//;
+
+function archivePath(version, filePath) {
+  return `${ARCHIVE_PREFIX}/v${version}/${filePath}`;
+}
+
+function isRootProjectBlob(path) {
+  if (!path || path === 'manifest.json') return false;
+  if (path.startsWith(`${ARCHIVE_PREFIX}/`)) return false;
+  if (LEGACY_VERSION_PREFIX.test(path)) return false;
+  return true;
+}
+
+async function listTreeBlobs(owner, repo, branch = null) {
+  const { sha } = await getDefaultBranchSha(owner, repo, branch);
+  const tree = await ghFetch(
+    `${API}/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`
+  );
+  return (tree.tree || []).filter((item) => item.type === 'blob');
+}
+
+async function loadFilesFromPrefix(owner, repo, prefix, branch = null) {
+  const blobs = await listTreeBlobs(owner, repo, branch);
+  const matches = blobs.filter((item) => {
+    if (prefix) return item.path.startsWith(prefix);
+    return isRootProjectBlob(item.path);
+  });
+
+  const files = {};
+  for (const item of matches) {
+    const rel = prefix ? item.path.slice(prefix.length) : item.path;
+    if (!rel) continue;
+    files[rel] = await getFileContent(owner, repo, item.path, branch);
+  }
+  return files;
+}
+
+async function putFileUpdate(owner, repo, path, content, message, branch = null) {
+  const sha = await getFileSha(owner, repo, path, branch);
+  return putFile(owner, repo, path, content, message, sha, branch);
+}
+
+async function saveAllProjectFiles(owner, repo, versionNum, files, branch = null) {
+  const entries = Object.entries(files);
+  const errors = [];
+  let saved = 0;
+
+  for (const [filePath, fileContent] of entries) {
+    try {
+      await putFileUpdate(
+        owner,
+        repo,
+        filePath,
+        fileContent,
+        `Design v${versionNum}: ${filePath}`,
+        branch
+      );
+      saved += 1;
+    } catch (err) {
+      console.error(`[Design] Failed to save ${filePath}:`, err.message);
+      errors.push({ path: filePath, error: err.message });
+    }
+  }
+
+  for (const [filePath, fileContent] of entries) {
+    if (errors.some((e) => e.path === filePath)) continue;
+    const archive = archivePath(versionNum, filePath);
+    try {
+      await putFileUpdate(
+        owner,
+        repo,
+        archive,
+        fileContent,
+        `Archive v${versionNum}: ${filePath}`,
+        branch
+      );
+    } catch (err) {
+      console.warn(`[Design] Archive copy failed for ${archive}:`, err.message);
+    }
+  }
+
+  if (errors.length) {
+    throw new Error(
+      `Saved ${saved}/${entries.length} files. Failed: ${errors.map((e) => e.path).join(', ')}`
+    );
+  }
+
+  return { saved, total: entries.length };
+}
+
+async function getDefaultBranchSha(owner, repo, branch = null) {
+  const repoData = await ghFetch(`${API}/repos/${owner}/${repo}`);
+  const ref = branch || repoData.default_branch;
+  const branchData = await ghFetch(`${API}/repos/${owner}/${repo}/branches/${ref}`);
+  return { sha: branchData.commit.commit.tree.sha, branch: ref };
+}
+
+export async function getVersionFiles(projectId, version) {
   const storage = await resolveProjectStorage(projectId, '', false);
-  const path = storage.basePath
-    ? `${storage.basePath}/v${version}/App.jsx`
-    : `v${version}/App.jsx`;
-  return getFileContent(storage.owner, storage.repo, path, storage.branch || null);
+  const { owner, repo } = storage;
+  const branch = storage.branch || null;
+
+  let manifest = null;
+  try {
+    manifest = await getProjectManifest(projectId);
+  } catch {
+    manifest = null;
+  }
+  const latestVersion = manifest?.versions?.[manifest.versions.length - 1]?.v;
+
+  try {
+    if (!version || version === latestVersion) {
+      const rootFiles = await loadFilesFromPrefix(owner, repo, '', branch);
+      if (Object.keys(rootFiles).length) return rootFiles;
+    }
+
+    const archivePrefix = `${ARCHIVE_PREFIX}/v${version}/`;
+    const archived = await loadFilesFromPrefix(owner, repo, archivePrefix, branch);
+    if (Object.keys(archived).length) return archived;
+
+    const legacyPrefix = storage.basePath
+      ? `${storage.basePath}/v${version}/`
+      : `v${version}/`;
+    const legacy = await loadFilesFromPrefix(owner, repo, legacyPrefix, branch);
+    if (Object.keys(legacy).length) return legacy;
+
+    const legacyApp = legacyPrefix + 'App.jsx';
+    try {
+      const code = await getFileContent(owner, repo, legacyApp, branch);
+      return { 'src/app/App.jsx': code };
+    } catch {
+      return {};
+    }
+  } catch (err) {
+    console.warn('[Design] getVersionFiles error:', err.message);
+    return {};
+  }
+}
+
+export async function getVersionTree(projectId, version) {
+  const files = await getVersionFiles(projectId, version);
+  return { version, files, fileCount: Object.keys(files).length };
+}
+
+export async function getVersionCode(projectId, version) {
+  const files = await getVersionFiles(projectId, version);
+  return files['src/app/App.jsx'] || files['App.jsx'] || Object.values(files)[0] || '';
+}
+
+export async function buildVersionZip(projectId, version) {
+  const files = await getVersionFiles(projectId, version);
+  if (!Object.keys(files).length) {
+    throw new Error('No files found for this version');
+  }
+  const zip = new AdmZip();
+  for (const [path, content] of Object.entries(files)) {
+    zip.addFile(path, Buffer.from(content, 'utf-8'));
+  }
+  return zip.toBuffer();
 }
 
 export async function saveDesignVersion({
@@ -294,7 +449,7 @@ export async function saveDesignVersion({
   name,
   prompt,
   iterationPrompt,
-  reactCode,
+  reactCode = null,
   files = null,
   createdAt,
   isNew,
@@ -330,26 +485,35 @@ export async function saveDesignVersion({
     prompt: iterationPrompt || prompt,
     createdAt: Date.now(),
     label: versionNum === 1 ? 'Initial' : `Version ${versionNum}`,
+    fileCount: 0,
   });
   manifest.updatedAt = Date.now();
 
-  const versionPath = `${pathPrefix}v${versionNum}/App.jsx`;
   const manifestPath = `${pathPrefix}manifest.json`;
+  const allFiles = files && typeof files === 'object' && Object.keys(files).length
+    ? files
+    : reactCode
+      ? { 'src/app/App.jsx': reactCode }
+      : null;
 
-  await putFile(owner, repo, versionPath, reactCode, `Design v${versionNum}: ${name}`);
-
-  if (files && typeof files === 'object') {
-    const fileEntries = Object.entries(files);
-    for (let i = 0; i < fileEntries.length; i += 3) {
-      const batch = fileEntries.slice(i, i + 3);
-      await Promise.all(
-        batch.map(([filePath, fileContent]) => {
-          const githubPath = `${pathPrefix}v${versionNum}/${filePath}`;
-          return putFile(owner, repo, githubPath, fileContent, `v${versionNum}: ${filePath}`);
-        })
-      );
-    }
+  if (!allFiles) {
+    throw new Error('No files to save');
   }
+
+  const fileEntries = Object.entries(allFiles);
+  const saveResult = await saveAllProjectFiles(
+    owner,
+    repo,
+    versionNum,
+    allFiles,
+    storage.branch || null
+  );
+
+  manifest.versions[manifest.versions.length - 1].fileCount = saveResult.saved;
+
+  const versionPath = fileEntries.find(([p]) => p === 'src/app/App.jsx')?.[0]
+    || fileEntries[0]?.[0]
+    || 'src/app/App.jsx';
 
   const manifestSha = await getFileSha(owner, repo, manifestPath);
   await putFile(
@@ -372,6 +536,7 @@ export async function saveDesignVersion({
     manifest,
     repoUrl,
     filePath: versionPath,
+    fileCount: saveResult.saved,
   };
 }
 
@@ -402,7 +567,9 @@ export async function saveProjectFiles(projectId, files, version) {
 export async function loadFullProject(projectId) {
   const manifest = await getProjectManifest(projectId);
   const latest = manifest.versions[manifest.versions.length - 1];
-  const code = latest ? await getVersionCode(projectId, latest.v) : '';
+  const versionNum = latest?.v || 1;
+  const files = latest ? await getVersionFiles(projectId, versionNum) : {};
+  const code = files['src/app/App.jsx'] || files['App.jsx'] || Object.values(files)[0] || '';
   const storage = await resolveProjectStorage(projectId, manifest.name, false, manifest);
 
   return {
@@ -410,11 +577,13 @@ export async function loadFullProject(projectId) {
     name: manifest.name,
     prompt: manifest.prompt,
     code,
+    files,
+    fileCount: Object.keys(files).length,
     status: 'done',
     createdAt: manifest.createdAt,
     iterations: manifest.versions.length,
     versions: manifest.versions,
-    activeVersion: latest?.v || 1,
+    activeVersion: versionNum,
     githubRepo: manifest.githubRepo,
     storage: manifest.storage,
     repoUrl: `https://github.com/${storage.owner}/${storage.repo}`,
